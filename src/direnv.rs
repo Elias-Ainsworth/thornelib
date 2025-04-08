@@ -9,6 +9,8 @@ pub enum DirenvError {
     Io(std::io::Error),
     #[error("UTF-8 Error: {0}")]
     Utf8(std::str::Utf8Error),
+    #[error("From UTF-8 Error: {0}")]
+    FromUtf8(std::string::FromUtf8Error),
     #[error("Command failed with status {status:?}: stderr")]
     CommandFailed {
         status: std::process::ExitStatus,
@@ -32,82 +34,91 @@ impl From<std::str::Utf8Error> for DirenvError {
     }
 }
 
+impl From<std::string::FromUtf8Error> for DirenvError {
+    fn from(error: std::string::FromUtf8Error) -> Self {
+        DirenvError::FromUtf8(error)
+    }
+}
+fn run_direnv(cmd_args: &[&str]) -> Result<std::process::Output> {
+    let output = Command::new("direnv")
+        .args(cmd_args)
+        .output()
+        .map_err(|e| DirenvError::Io(e))?;
+    if !output.status.success() {
+        return Err(DirenvError::CommandFailed {
+            status: output.status,
+            stderr: String::from_utf8(output.stderr)?,
+        });
+    }
+    Ok(output)
+}
+fn path_to_str(path: &Path) -> Result<&str> {
+    Ok(path.to_str().ok_or(DirenvError::InvalidPath)?)
+}
+
 impl Direnv {
     pub fn allow(path: &Path) -> Result<()> {
-        Command::new("direnv")
-            .args(["allow", path.to_str().ok_or(DirenvError::InvalidPath)?])
-            .output()?;
+        run_direnv(&["allow", path_to_str(path)?])?;
         Ok(())
     }
     pub fn block(path: &Path) -> Result<()> {
-        Command::new("direnv")
-            .args(["block", path.to_str()])
-            .output()?;
+        run_direnv(&["block", path_to_str(path)?])?;
         Ok(())
     }
     pub fn deny(path: &Path) -> Result<()> {
-        Command::new("direnv")
-            .args(["deny", path.to_str()])
-            .output()?;
+        run_direnv(&["deny", path_to_str(path)?])?;
         Ok(())
     }
     pub fn edit(path: &Path) -> Result<()> {
-        Command::new("direnv")
-            .args(["edit", path.to_str()])
-            .output()?;
+        run_direnv(&["edit", path_to_str(path)?])?;
         Ok(())
     }
-    pub fn exec(path: &Path, cmd_args: &[&str]) -> Result<()> {
-        Command::new("direnv")
-            .args(["exec", path.to_str()])
-            .args(cmd_args)
-            .output()?;
-        Ok(())
+    pub fn exec(path: &Path, cmd_args: &[&str]) -> Result<String> {
+        let mut args = vec!["exec", path_to_str(path)?];
+        args.extend_from_slice(cmd_args);
+        let output = run_direnv(&args)?;
+        Ok(String::from_utf8(output.stdout)?)
     }
     pub fn export(shell: &str) -> Result<()> {
-        Command::new("direnv").args(["export", shell]).output()?;
+        run_direnv(&["export", shell])?;
         Ok(())
     }
-    pub fn fetchurl(url: &str) -> Result<()> {
-        Command::new("direnv").args(["fetchurl", url]).output()?;
-        Ok(())
+    pub fn fetchurl(url: &str, hash: &str) -> Result<String> {
+        let output = run_direnv(&["fetchurl", url, hash])?;
+        Ok(String::from_utf8(output.stdout)?)
     }
     pub fn grant(path: &Path) -> Result<()> {
-        Command::new("direnv")
-            .args(["grant", path.to_str()])
-            .output()?;
+        run_direnv(&["edit", path_to_str(path)?])?;
         Ok(())
     }
-    pub fn hook(shell: &str) -> Result<()> {
-        Command::new("direnv").args(["hook", shell]).output()?;
-        Ok(())
+    pub fn hook(shell: &str) -> Result<String> {
+        let output = run_direnv(&["hook", shell])?;
+        Ok(String::from_utf8(output.stdout)?)
     }
     pub fn permit(path: &Path) -> Result<()> {
-        Command::new("direnv")
-            .args(["permit", path.to_str()])
-            .output()?;
+        run_direnv(&["permit", path_to_str(path)?])?;
         Ok(())
     }
     pub fn prune() -> Result<()> {
-        Command::new("direnv").arg("prune").output()?;
+        run_direnv(&["prune"])?;
         Ok(())
     }
     pub fn reload() -> Result<()> {
-        Command::new("direnv").arg("prune").output()?;
+        run_direnv(&["reload"])?;
         Ok(())
     }
     pub fn revoke(path: &Path) -> Result<()> {
-        Command::new("direnv")
-            .arg(["revoke", path.to_str()])
-            .output()?;
+        run_direnv(&["permit", path_to_str(path)?])?;
         Ok(())
     }
-    pub fn status() -> Result<()> {
-        Command::new("direnv").arg("status").output()?;
-        Ok(())
+    pub fn status(cmd_args: &[&str]) -> Result<String> {
+        let mut args = vec!["status"];
+        args.extend_from_slice(cmd_args);
+        let output = run_direnv(&args)?;
+        Ok(String::from_utf8(output.stdout)?)
     }
     pub fn stdlib() -> Result<()> {
-        Command::new("direnv").arg("status").output()?;
+        run_direnv(&["stdlib"])?;
         Ok(())
     }
 }
