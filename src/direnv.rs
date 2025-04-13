@@ -1,16 +1,24 @@
-use std::{path::Path, process::Command};
+use std::{
+    any::Any,
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    result, str,
+};
 use thiserror::Error;
 
-pub struct Direnv;
+#[derive(Error, Debug)]
+#[error("Canonicalization Error: {0}")]
+pub struct CanonicalizeError(#[from] std::io::Error);
 
 #[derive(Error, Debug)]
 pub enum DirenvError {
     #[error("I/O Error: {0}")]
-    Io(std::io::Error),
+    Io(#[from] std::io::Error),
     #[error("UTF-8 Error: {0}")]
-    Utf8(std::str::Utf8Error),
+    Utf8(#[from] std::str::Utf8Error),
     #[error("From UTF-8 Error: {0}")]
-    FromUtf8(std::string::FromUtf8Error),
+    FromUtf8(#[from] std::string::FromUtf8Error),
     #[error("Command failed with status {status:?}: stderr")]
     CommandFailed {
         status: std::process::ExitStatus,
@@ -18,107 +26,139 @@ pub enum DirenvError {
     },
     #[error("Invalid path (non-UTF-8)")]
     InvalidPath,
+    #[error(transparent)]
+    CanonicalizeError(#[from] CanonicalizeError),
 }
 
-pub type Result<T> = std::result::Result<T, DirenvError>;
+pub type Result<T> = result::Result<T, DirenvError>;
 
-impl From<std::io::Error> for DirenvError {
-    fn from(error: std::io::Error) -> Self {
-        DirenvError::Io(error)
+pub trait DirenvRunner: Any {
+    fn run_direnv(&self, cmd_args: &[String]) -> Result<Output>;
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub struct RealDirenv;
+
+impl DirenvRunner for RealDirenv {
+    fn run_direnv(&self, cmd_args: &[String]) -> Result<Output> {
+        let output = Command::new("direnv").args(cmd_args).output()?;
+        if !output.status.success() {
+            return Err(DirenvError::CommandFailed {
+                status: output.status,
+                stderr: String::from_utf8(output.stderr)?,
+            });
+        }
+        Ok(output)
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
-impl From<std::str::Utf8Error> for DirenvError {
-    fn from(error: std::str::Utf8Error) -> Self {
-        DirenvError::Utf8(error)
-    }
+fn canonicalize_path(path: &Path) -> result::Result<PathBuf, CanonicalizeError> {
+    Ok(fs::canonicalize(path)?)
 }
 
-impl From<std::string::FromUtf8Error> for DirenvError {
-    fn from(error: std::string::FromUtf8Error) -> Self {
-        DirenvError::FromUtf8(error)
-    }
+fn path_to_str(path: &Path) -> Result<String> {
+    Ok(canonicalize_path(path)?
+        .as_path()
+        .to_str()
+        .ok_or(DirenvError::InvalidPath)?
+        .to_owned())
 }
-fn run_direnv(cmd_args: &[&str]) -> Result<std::process::Output> {
-    let output = Command::new("direnv")
-        .args(cmd_args)
-        .output()
-        .map_err(|e| DirenvError::Io(e))?;
-    if !output.status.success() {
-        return Err(DirenvError::CommandFailed {
-            status: output.status,
-            stderr: String::from_utf8(output.stderr)?,
-        });
-    }
-    Ok(output)
-}
-fn path_to_str(path: &Path) -> Result<&str> {
-    Ok(path.to_str().ok_or(DirenvError::InvalidPath)?)
+
+pub struct Direnv {
+    runner: Box<dyn DirenvRunner>,
 }
 
 impl Direnv {
-    pub fn allow(path: &Path) -> Result<()> {
-        run_direnv(&["allow", path_to_str(path)?])?;
+    pub fn new() -> Self {
+        Direnv {
+            runner: Box::new(RealDirenv),
+        }
+    }
+    pub fn with_runner(runner: Box<dyn DirenvRunner>) -> Self {
+        Direnv { runner }
+    }
+    pub fn allow(&self, path: &Path) -> Result<()> {
+        let canonicalized_str = path_to_str(path)?;
+        self.runner
+            .run_direnv(&["allow".to_string(), canonicalized_str])?;
         Ok(())
     }
-    pub fn block(path: &Path) -> Result<()> {
-        run_direnv(&["block", path_to_str(path)?])?;
+    pub fn block(&self, path: &Path) -> Result<()> {
+        let canonicalized_str = path_to_str(path)?;
+        self.runner
+            .run_direnv(&["block".to_string(), canonicalized_str])?;
         Ok(())
     }
-    pub fn deny(path: &Path) -> Result<()> {
-        run_direnv(&["deny", path_to_str(path)?])?;
+    pub fn deny(&self, path: &Path) -> Result<()> {
+        let canonicalized_str = path_to_str(path)?;
+        self.runner
+            .run_direnv(&["deny".to_string(), canonicalized_str])?;
         Ok(())
     }
-    pub fn edit(path: &Path) -> Result<()> {
-        run_direnv(&["edit", path_to_str(path)?])?;
+    pub fn edit(&self, path: &Path) -> Result<()> {
+        let canonicalized_str = path_to_str(path)?;
+        self.runner
+            .run_direnv(&["edit".to_string(), canonicalized_str])?;
         Ok(())
     }
-    pub fn exec(path: &Path, cmd_args: &[&str]) -> Result<String> {
-        let mut args = vec!["exec", path_to_str(path)?];
+    pub fn exec(&self, path: &Path, cmd_args: &[String]) -> Result<String> {
+        let canonicalized_str = path_to_str(path)?;
+        let mut args = vec!["exec".to_string(), canonicalized_str];
         args.extend_from_slice(cmd_args);
-        let output = run_direnv(&args)?;
+        let output = self.runner.run_direnv(&args)?;
         Ok(String::from_utf8(output.stdout)?)
     }
-    pub fn export(shell: &str) -> Result<()> {
-        run_direnv(&["export", shell])?;
+    pub fn export(&self, shell: String) -> Result<()> {
+        self.runner.run_direnv(&["export".to_string(), shell])?;
         Ok(())
     }
-    pub fn fetchurl(url: &str, hash: &str) -> Result<String> {
-        let output = run_direnv(&["fetchurl", url, hash])?;
+    pub fn fetchurl(&self, url: String, hash: String) -> Result<String> {
+        let output = self
+            .runner
+            .run_direnv(&["fetchurl".to_string(), url, hash])?;
         Ok(String::from_utf8(output.stdout)?)
     }
-    pub fn grant(path: &Path) -> Result<()> {
-        run_direnv(&["edit", path_to_str(path)?])?;
+    pub fn grant(&self, path: &Path) -> Result<()> {
+        let canonicalized_str = path_to_str(path)?;
+        self.runner
+            .run_direnv(&["grant".to_string(), canonicalized_str])?;
         Ok(())
     }
-    pub fn hook(shell: &str) -> Result<String> {
-        let output = run_direnv(&["hook", shell])?;
+    pub fn hook(&self, shell: String) -> Result<String> {
+        let output = self.runner.run_direnv(&["hook".to_string(), shell])?;
         Ok(String::from_utf8(output.stdout)?)
     }
-    pub fn permit(path: &Path) -> Result<()> {
-        run_direnv(&["permit", path_to_str(path)?])?;
+    pub fn permit(&self, path: &Path) -> Result<()> {
+        let canonicalized_str = path_to_str(path)?;
+        self.runner
+            .run_direnv(&["permit".to_string(), canonicalized_str])?;
         Ok(())
     }
-    pub fn prune() -> Result<()> {
-        run_direnv(&["prune"])?;
+    pub fn prune(&self) -> Result<()> {
+        self.runner.run_direnv(&["prune".to_string()])?;
         Ok(())
     }
-    pub fn reload() -> Result<()> {
-        run_direnv(&["reload"])?;
+    pub fn reload(&self) -> Result<()> {
+        self.runner.run_direnv(&["reload".to_string()])?;
         Ok(())
     }
-    pub fn revoke(path: &Path) -> Result<()> {
-        run_direnv(&["permit", path_to_str(path)?])?;
+    pub fn revoke(&self, path: &Path) -> Result<()> {
+        let canonicalized_str = path_to_str(path)?;
+        self.runner
+            .run_direnv(&["revoke".to_string(), canonicalized_str])?;
         Ok(())
     }
-    pub fn status(cmd_args: &[&str]) -> Result<String> {
-        let mut args = vec!["status"];
+    pub fn status(&self, cmd_args: &[String]) -> Result<String> {
+        let mut args = vec!["status".to_string()];
         args.extend_from_slice(cmd_args);
-        let output = run_direnv(&args)?;
+        let output = self.runner.run_direnv(&args)?;
         Ok(String::from_utf8(output.stdout)?)
     }
-    pub fn stdlib() -> Result<()> {
-        run_direnv(&["stdlib"])?;
+    pub fn stdlib(&self) -> Result<()> {
+        self.runner.run_direnv(&["stdlib".to_string()])?;
         Ok(())
     }
 }
@@ -126,9 +166,51 @@ impl Direnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
+    use std::cell::RefCell;
+    use std::os::unix::process::ExitStatusExt;
+
+    struct MockRunner {
+        pub called_with: RefCell<Vec<Vec<String>>>,
+    }
+    impl MockRunner {
+        fn new() -> Self {
+            MockRunner {
+                called_with: RefCell::new(vec![]),
+            }
+        }
+        fn get_calls(&self) -> Vec<Vec<String>> {
+            self.called_with.borrow().clone()
+        }
+    }
+
+    impl DirenvRunner for MockRunner {
+        fn run_direnv(&self, cmd_args: &[String]) -> Result<Output> {
+            self.called_with.borrow_mut().push(cmd_args.to_vec());
+
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: b"mock output".to_vec(),
+                stderr: vec![],
+            })
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
     #[test]
-    fn direnv_allow() -> Result<()> {
-        Direnv::allow(Path::new(""))?;
+    fn direnv_stdlib_ok() -> Result<()> {
+        let direnv = Direnv::with_runner(Box::new(MockRunner::new()));
+        direnv.stdlib()?;
+
+        let calls = direnv
+            .runner
+            .as_any()
+            .downcast_ref::<MockRunner>()
+            .expect("expected MockRunner")
+            .get_calls();
+        assert_eq!(calls[0], vec!["stdlib".to_string()]);
         Ok(())
     }
 }
